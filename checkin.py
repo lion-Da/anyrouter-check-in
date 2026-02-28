@@ -133,10 +133,9 @@ def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
-
+		print(response)
 		if response.status_code == 200:
 			data = response.json()
-			print("debug:",data)
 			if data.get('success'):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
