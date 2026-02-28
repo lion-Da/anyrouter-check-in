@@ -22,6 +22,74 @@ load_dotenv()
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
 
+class ClientManager:
+	"""管理域名级别的 httpx.Client 实例
+
+	确保每个不同的域名都有独立的客户端连接，避免跨域 Cookie 污染
+	和 HTTP/2 连接复用问题
+	"""
+
+	def __init__(self):
+		"""初始化客户端管理器"""
+		self.clients: dict[str, httpx.Client] = {}
+
+	def get_client(self, domain: str) -> httpx.Client:
+		"""获取指定域名的客户端
+
+		Args:
+			domain: 完整的域名（包括 http:// 或 https://）
+
+		Returns:
+			该域名的 httpx.Client 实例
+		"""
+		if domain not in self.clients:
+			self.clients[domain] = httpx.Client(http2=True, timeout=30.0)
+		return self.clients[domain]
+
+	def set_cookies(self, domain: str, cookies: dict) -> None:
+		"""为指定域名的客户端设置 cookies
+
+		Args:
+			domain: 完整的域名
+			cookies: Cookie 字典
+		"""
+		client = self.get_client(domain)
+		client.cookies.update(cookies)
+
+	def close_all(self) -> None:
+		"""关闭所有管理的客户端连接"""
+		for domain, client in self.clients.items():
+			try:
+				client.close()
+				print(f'[CLEANUP] Closed client for domain: {domain}')
+			except Exception as e:
+				print(f'[WARNING] Failed to close client for {domain}: {e}')
+		self.clients.clear()
+
+	def close_domain(self, domain: str) -> None:
+		"""关闭特定域名的客户端
+
+		Args:
+			domain: 完整的域名
+		"""
+		if domain in self.clients:
+			try:
+				self.clients[domain].close()
+				del self.clients[domain]
+				print(f'[CLEANUP] Closed client for domain: {domain}')
+			except Exception as e:
+				print(f'[WARNING] Failed to close client for {domain}: {e}')
+
+	def __enter__(self):
+		"""上下文管理器入口"""
+		return self
+
+	def __exit__(self, exc_type, exc_val, exc_tb):
+		"""上下文管理器出口，自动关闭所有客户端"""
+		self.close_all()
+		return False
+
+
 def load_balance_hash():
 	"""加载余额hash"""
 	try:
@@ -129,20 +197,27 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				return None
 
 
-def get_user_info(client, headers, user_info_url: str):
-	"""获取用户信息"""
+def get_user_info(client_manager: ClientManager, domain: str, headers, user_info_url: str):
+	"""获取用户信息
+
+	Args:
+		client_manager: ClientManager 实例
+		domain: 提供商域名
+		headers: 请求头
+		user_info_url: 用户信息 URL
+
+	Returns:
+		包含用户信息的字典
+	"""
 	try:
+		client = client_manager.get_client(domain)
 		response = client.get(user_info_url, headers=headers, timeout=30)
-		print(response)
-		if true:
+		if response.status_code == 200:
 			data = response.json()
-			if true:
+			if data.get('success'):
 				user_data = data.get('data', {})
-				print(user_data)
 				quota = round(user_data.get('quota', 0) / 500000, 2)
-				print(quota)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				print(used_quota)
 				return {
 					'success': True,
 					'quota': quota,
@@ -170,14 +245,26 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 	return {**waf_cookies, **user_cookies}
 
 
-def execute_check_in(client, account_name: str, provider_config, headers: dict):
-	"""执行签到请求"""
+def execute_check_in(client_manager: ClientManager, domain: str, account_name: str, provider_config, headers: dict):
+	"""执行签到请求
+
+	Args:
+		client_manager: ClientManager 实例
+		domain: 提供商域名
+		account_name: 账号名称
+		provider_config: 提供商配置
+		headers: 请求头
+
+	Returns:
+		签到是否成功
+	"""
 	print(f'[NETWORK] {account_name}: Executing check-in')
 
 	checkin_headers = headers.copy()
 	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
 
 	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
+	client = client_manager.get_client(domain)
 	response = client.post(sign_in_url, headers=checkin_headers, timeout=30)
 
 	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
@@ -259,32 +346,41 @@ def format_check_in_notification(detail: dict) -> str:
 	return '\n'.join(lines)
 
 
-async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
-	"""为单个账号执行签到操作"""
+async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig, client_manager: ClientManager):
+	"""为单个账号执行签到操作
+
+	Args:
+		account: 账号配置
+		account_index: 账号索引
+		app_config: 应用配置
+		client_manager: 客户端管理器
+
+	Returns:
+		(success, user_info_before, user_info_after) 元组
+	"""
 	account_name = account.get_display_name(account_index)
 	print(f'\n[PROCESSING] Starting to process {account_name}')
 
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies:
 		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+		return False, None, None
 
 	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 	if not all_cookies:
-		return False, None
+		return False, None, None
 
-	client = httpx.Client(http2=True, timeout=30.0)
+	# 为该域名的客户端设置 cookies
+	client_manager.set_cookies(provider_config.domain, all_cookies)
 
 	try:
-		client.cookies.update(all_cookies)
-
 		headers = {
 			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
 			'Accept': 'application/json, text/plain, */*',
@@ -300,28 +396,26 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-		user_info_before = get_user_info(client, headers, user_info_url)
+		user_info_before = get_user_info(client_manager, provider_config.domain, headers, user_info_url)
 		if user_info_before and user_info_before.get('success'):
 			print(user_info_before['display'])
 		elif user_info_before:
 			print(user_info_before.get('error', 'Unknown error'))
 
 		if provider_config.needs_manual_check_in():
-			success = execute_check_in(client, account_name, provider_config, headers)
+			success = execute_check_in(client_manager, provider_config.domain, account_name, provider_config, headers)
 			# 签到后再次获取用户信息，用于计算签到收益
-			user_info_after = get_user_info(client, headers, user_info_url)
+			user_info_after = get_user_info(client_manager, provider_config.domain, headers, user_info_url)
 			return success, user_info_before, user_info_after
 		else:
 			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
 			# 自动签到的情况，再次获取用户信息
-			user_info_after = get_user_info(client, headers, user_info_url)
+			user_info_after = get_user_info(client_manager, provider_config.domain, headers, user_info_url)
 			return True, user_info_before, user_info_after
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
 		return False, None, None
-	finally:
-		client.close()
 
 
 async def main():
@@ -349,74 +443,83 @@ async def main():
 	need_notify = False  # 是否需要发送通知
 	balance_changed = False  # 余额是否有变化
 
-	for i, account in enumerate(accounts):
-		account_key = f'account_{i + 1}'
-		try:
-			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
-			if success:
-				success_count += 1
+	# 创建客户端管理器
+	client_manager = ClientManager()
 
-			should_notify_this_account = False
+	try:
+		for i, account in enumerate(accounts):
+			account_key = f'account_{i + 1}'
+			try:
+				success, user_info_before, user_info_after = await check_in_account(account, i, app_config, client_manager)
+				if success:
+					success_count += 1
 
-			if not success:
-				should_notify_this_account = True
-				need_notify = True
-				account_name = account.get_display_name(i)
-				print(f'[NOTIFY] {account_name} failed, will send notification')
+				should_notify_this_account = False
 
-			# 存储签到前后的余额信息
-			if user_info_after and user_info_after.get('success'):
-				current_quota = user_info_after['quota']
-				current_used = user_info_after['used_quota']
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
+				if not success:
+					should_notify_this_account = True
+					need_notify = True
+					account_name = account.get_display_name(i)
+					print(f'[NOTIFY] {account_name} failed, will send notification')
 
-				# 计算签到收益
-				if user_info_before and user_info_before.get('success'):
-					before_quota = user_info_before['quota']
-					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
-
-					# 计算总额度（余额 + 历史消耗）
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
-
-					# 签到获得的额度 = 总额度增加量
-					check_in_reward = total_after - total_before
-
-					# 本次消耗 = 历史消耗增加量
-					usage_increase = after_used - before_used
-
-					# 余额变化
-					balance_change = after_quota - before_quota
-
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,  # 签到获得
-						'usage_increase': usage_increase,  # 本次消耗
-						'balance_change': balance_change,  # 余额变化
-						'success': success,
-					}
-
-			if should_notify_this_account:
-				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
+				# 存储签到前后的余额信息
 				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
-				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
+					current_quota = user_info_after['quota']
+					current_used = user_info_after['used_quota']
+					current_balances[account_key] = {'quota': current_quota, 'used': current_used}
 
-		except Exception as e:
-			account_name = account.get_display_name(i)
-			print(f'[FAILED] {account_name} processing exception: {e}')
-			need_notify = True  # 异常也需要通知
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+					# 计算签到收益
+					if user_info_before and user_info_before.get('success'):
+						before_quota = user_info_before['quota']
+						before_used = user_info_before['used_quota']
+						after_quota = user_info_after['quota']
+						after_used = user_info_after['used_quota']
+
+						# 计算总额度（余额 + 历史消耗）
+						total_before = before_quota + before_used
+						total_after = after_quota + after_used
+
+						# 签到获得的额度 = 总额度增加量
+						check_in_reward = total_after - total_before
+
+						# 本次消耗 = 历史消耗增加量
+						usage_increase = after_used - before_used
+
+						# 余额变化
+						balance_change = after_quota - before_quota
+
+						account_check_in_details[account_key] = {
+							'name': account.get_display_name(i),
+							'before_quota': before_quota,
+							'before_used': before_used,
+							'after_quota': after_quota,
+							'after_used': after_used,
+							'check_in_reward': check_in_reward,  # 签到获得
+							'usage_increase': usage_increase,  # 本次消耗
+							'balance_change': balance_change,  # 余额变化
+							'success': success,
+						}
+
+				if should_notify_this_account:
+					account_name = account.get_display_name(i)
+					status = '[SUCCESS]' if success else '[FAIL]'
+					account_result = f'{status} {account_name}'
+					if user_info_after and user_info_after.get('success'):
+						account_result += f'\n{user_info_after["display"]}'
+					elif user_info_after:
+						account_result += f'\n{user_info_after.get("error", "Unknown error")}'
+					notification_content.append(account_result)
+
+			except Exception as e:
+				account_name = account.get_display_name(i)
+				print(f'[FAILED] {account_name} processing exception: {e}')
+				need_notify = True  # 异常也需要通知
+				notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+
+	finally:
+		# 确保所有客户端连接都被正确关闭
+		client_manager.close_all()
+		print('[SYSTEM] All client connections closed')
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
