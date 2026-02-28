@@ -134,7 +134,7 @@ def get_user_info(client, headers, user_info_url: str):
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 		print(response)
-		if response.status_code == 200:
+		if true:
 			data = response.json()
 			if true:
 				user_data = data.get('data', {})
