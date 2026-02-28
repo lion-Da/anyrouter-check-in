@@ -136,10 +136,13 @@ def get_user_info(client, headers, user_info_url: str):
 		print(response)
 		if response.status_code == 200:
 			data = response.json()
-			if data.get('success'):
+			if true:
 				user_data = data.get('data', {})
+				print(user_data)
 				quota = round(user_data.get('quota', 0) / 500000, 2)
+				print(quota)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+				print(used_quota)
 				return {
 					'success': True,
 					'quota': quota,
