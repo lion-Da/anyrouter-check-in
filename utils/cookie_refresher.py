@@ -7,23 +7,56 @@ Cookie 刷新模块
    LinuxDo 的登录态跨次运行保留，用户只需首次登录一次。
 2. 所有失败站点共享同一个浏览器实例（同一个 BrowserContext），
    浏览器按域名天然隔离 cookie，LinuxDo OAuth 登录态自动复用。
-3. 导航到站点登录页 → 点击 LinuxDo OAuth → 自动回调 → 轮询目标站 session cookie。
+3. 完整的 OAuth 流程：
+   导航到站点登录页 → 用户在浏览器中完成 LinuxDo OAuth 认证
+   → 回调到站点 → 用户完成"连接/绑定"操作 → 站点生成 session cookie
+   → 脚本检测到 session cookie → 抓取并更新配置。
+4. 等待过程中随时可按 Enter 跳过当前账号。
 """
 
+import asyncio
 import json
 import os
+import sys
+import threading
 
 from playwright.async_api import async_playwright
 
 # 持久化浏览器用户数据目录（保存 LinuxDo 登录态等）
 BROWSER_DATA_DIR = os.path.join(os.path.expanduser('~'), '.anyrouter-browser-data')
 
-# 单个站点 OAuth 回调等待时间（秒）—— 如果 LinuxDo 已登录，回调通常 5~15s 内完成
-OAUTH_AUTO_TIMEOUT = 30
-# 需要用户手动登录 LinuxDo 时的最大等待时间（秒）
-MANUAL_LOGIN_TIMEOUT = 300
+# 等待用户完成登录+连接的最大时间（秒）
+LOGIN_TIMEOUT = 300
 # 轮询 cookie 的间隔（秒）
 POLL_INTERVAL = 1.5
+
+
+# ────────────────────────────────────────────────────────────
+# 非阻塞 stdin 监听（用于 "按 Enter 跳过"）
+# ────────────────────────────────────────────────────────────
+
+def _start_skip_listener(loop: asyncio.AbstractEventLoop) -> asyncio.Event:
+	"""启动一个后台线程监听 stdin，按 Enter 时设置 asyncio.Event
+
+	Args:
+		loop: 当前运行的事件循环
+
+	Returns:
+		skip_event: 外部通过 skip_event.is_set() 检查是否按下了 Enter
+	"""
+	skip_event = asyncio.Event()
+
+	def _listen():
+		try:
+			sys.stdin.readline()
+		except (EOFError, OSError):
+			pass
+		# 线程安全地在事件循环中设置 event
+		loop.call_soon_threadsafe(skip_event.set)
+
+	t = threading.Thread(target=_listen, daemon=True)
+	t.start()
+	return skip_event
 
 
 def update_env_accounts(accounts_data: list, env_file: str = '.env') -> bool:
@@ -65,25 +98,42 @@ def update_env_accounts(accounts_data: list, env_file: str = '.env') -> bool:
 		return False
 
 
-async def _poll_session_cookie(context, domain: str, label: str, timeout: int) -> dict | None:
-	"""轮询等待目标域名出现 session cookie
+async def _poll_session_cookie(
+	context,
+	domain: str,
+	label: str,
+	timeout: int,
+	skip_event: asyncio.Event | None = None,
+) -> dict | None:
+	"""轮询等待目标域名出现 session cookie，支持 Enter 跳过
+
+	站点在完成 OAuth 认证 + 连接/绑定 后才会写入 session cookie，
+	因此本函数会一直等到：
+	- session cookie 出现（成功）
+	- 达到超时时间（失败）
+	- 用户按下 Enter（跳过）
 
 	Args:
 		context: Playwright BrowserContext
 		domain: 目标域名 (e.g. "https://anyrouter.top")
 		label: 日志标签
 		timeout: 最大等待秒数
+		skip_event: 按 Enter 时会被 set 的事件，为 None 则不支持跳过
 
 	Returns:
-		该域名下所有 cookie 的 {name: value} 字典，超时返回 None
+		该域名下所有 cookie 的 {name: value} 字典，超时/跳过返回 None
 	"""
-	import asyncio
 	import time
 
 	start = time.monotonic()
 	last_msg_time = start
 
 	while time.monotonic() - start < timeout:
+		# 检查是否被用户跳过
+		if skip_event and skip_event.is_set():
+			print(f'  [SKIP] {label}: 用户按下 Enter，跳过当前账号')
+			return None
+
 		all_cookies = await context.cookies(domain)
 		cookies_dict = {}
 		for c in all_cookies:
@@ -94,18 +144,19 @@ async def _poll_session_cookie(context, domain: str, label: str, timeout: int) -
 
 		if 'session' in cookies_dict and len(cookies_dict['session']) > 20:
 			elapsed = int(time.monotonic() - start)
-			print(f'  [SUCCESS] {label}: session cookie captured ({elapsed}s)')
+			print(f'  [SUCCESS] {label}: session cookie 已捕获 ({elapsed}s)')
 			return cookies_dict
 
 		# 每 30 秒打印一次等待提示
 		now = time.monotonic()
 		if now - last_msg_time >= 30:
 			remaining = int(timeout - (now - start))
-			print(f'  [WAITING] {label}: Still waiting for login... ({remaining}s remaining)')
+			print(f'  [WAITING] {label}: 仍在等待登录完成... (剩余 {remaining}s，按 Enter 跳过)')
 			last_msg_time = now
 
 		await asyncio.sleep(POLL_INTERVAL)
 
+	print(f'  [TIMEOUT] {label}: 等待超时 ({timeout}s)')
 	return None
 
 
@@ -129,18 +180,23 @@ async def _refresh_in_shared_browser(
 ) -> tuple[int, set]:
 	"""在共享的持久化浏览器中，依次为所有失败账号刷新 cookie
 
-	流程：
+	完整流程：
 	1. 启动持久化 context（保留 LinuxDo 登录态）
 	2. 检测 LinuxDo 是否已登录
-	   - 已登录：直接开始，每个站点自动 OAuth 回调
-	   - 未登录：先导航到 linux.do 让用户登录一次
-	3. 逐个站点：打开标签页 → 导航到登录页 → 等待 session cookie → 关闭标签页
+	   - 已登录：提示用户，直接开始
+	   - 未登录：导航到 linux.do 让用户登录一次
+	3. 逐个站点：
+	   a. 新标签页 → 导航到站点登录页
+	   b. 用户在浏览器中完成 OAuth 认证 + 连接/绑定
+	   c. 轮询等待站点域名下出现 session cookie
+	   d. 等待过程中可按 Enter 跳过当前账号
+	   e. 关闭标签页 → 下一个站点
 	4. 所有站点完成后关闭浏览器
 
 	Returns:
 		(refreshed_count, updated_indices)
 	"""
-	import asyncio
+	import time
 
 	total = len(failed_accounts)
 	refreshed_count = 0
@@ -165,36 +221,40 @@ async def _refresh_in_shared_browser(
 			linuxdo_logged_in = await _check_linuxdo_logged_in(context)
 
 			if linuxdo_logged_in:
-				print('[INFO] LinuxDo 已登录（持久化 session 有效），将自动完成 OAuth 回调')
+				print('[INFO] LinuxDo 已登录（持久化 session 有效）')
+				print('[INFO] 每个站点仍需在浏览器中完成 OAuth 授权 + 连接操作')
 			else:
-				print('\n[BROWSER] LinuxDo 未登录，请在浏览器中登录 LinuxDo（仅需一次）')
-				print('[BROWSER] 登录完成后，后续所有站点将自动完成 OAuth 认证')
+				print('\n[BROWSER] LinuxDo 未登录，请先在浏览器中登录 LinuxDo')
+				print('[BROWSER] 登录完成后，后续站点可通过 OAuth 快速认证')
 
 				page = await context.new_page()
 				try:
 					await page.goto('https://linux.do', wait_until='domcontentloaded', timeout=30000)
 				except Exception as e:
-					print(f'[WARNING] LinuxDo page load issue: {str(e)[:80]}')
+					print(f'[WARNING] LinuxDo 页面加载异常: {str(e)[:80]}')
 
-				# 等待用户登录 LinuxDo
-				print(f'[BROWSER] 等待 LinuxDo 登录... (最长 {MANUAL_LOGIN_TIMEOUT}s)')
-				import time
+				# 等待用户登录 LinuxDo（支持 Enter 跳过）
+				print(f'[BROWSER] 等待 LinuxDo 登录... (最长 {LOGIN_TIMEOUT}s，按 Enter 跳过)')
+				loop = asyncio.get_running_loop()
+				skip_event = _start_skip_listener(loop)
+
 				start = time.monotonic()
-				while time.monotonic() - start < MANUAL_LOGIN_TIMEOUT:
+				while time.monotonic() - start < LOGIN_TIMEOUT:
+					if skip_event.is_set():
+						print('[SKIP] 用户跳过 LinuxDo 登录')
+						break
 					if await _check_linuxdo_logged_in(context):
 						print('[SUCCESS] LinuxDo 登录成功！')
 						linuxdo_logged_in = True
 						break
 					await asyncio.sleep(POLL_INTERVAL)
 
-				if not linuxdo_logged_in:
-					print('[TIMEOUT] LinuxDo 登录超时，跳过 Cookie 刷新')
-					await page.close()
-					await context.close()
-					return 0, set()
+				if not linuxdo_logged_in and not skip_event.is_set():
+					print('[TIMEOUT] LinuxDo 登录超时')
 
-				# 登录成功后等一下让 cookie 稳定
-				await asyncio.sleep(1)
+				# 登录成功后稍等让 cookie 稳定
+				if linuxdo_logged_in:
+					await asyncio.sleep(1)
 				await page.close()
 
 			# ====== 逐个刷新失败站点 ======
@@ -206,26 +266,26 @@ async def _refresh_in_shared_browser(
 				print(f'🔄 [{seq}/{total}] {label}')
 				print(f'   {login_url}')
 				print(f'{"─" * 60}')
+				print(f'  📋 请在浏览器中完成：OAuth 登录 → 连接/绑定账号')
+				print(f'  ⏎  按 Enter 跳过当前账号')
 
 				page = await context.new_page()
 
 				try:
 					await page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
 				except Exception as e:
-					print(f'  [WARNING] Page load issue (may still work): {str(e)[:80]}')
+					print(f'  [WARNING] 页面加载异常 (可能仍可操作): {str(e)[:80]}')
 
-				# 第一阶段：快速等待（OAuth 自动回调，通常 5~15s）
+				# 启动 Enter 跳过监听
+				loop = asyncio.get_running_loop()
+				skip_event = _start_skip_listener(loop)
+
+				# 等待用户在浏览器中完成完整的登录流程（OAuth + 连接）
 				cookies = await _poll_session_cookie(
-					context, acc['domain'], label, timeout=OAUTH_AUTO_TIMEOUT,
+					context, acc['domain'], label,
+					timeout=LOGIN_TIMEOUT,
+					skip_event=skip_event,
 				)
-
-				if not cookies:
-					# 第二阶段：自动回调未成功，可能需要用户手动操作
-					print(f'  [INFO] {label}: 自动 OAuth 未完成，请在浏览器中手动完成登录')
-					print(f'  [INFO] 等待手动登录... (最长 {MANUAL_LOGIN_TIMEOUT}s)')
-					cookies = await _poll_session_cookie(
-						context, acc['domain'], label, timeout=MANUAL_LOGIN_TIMEOUT,
-					)
 
 				# 关闭当前站点标签页（不影响 context 中的 cookie）
 				await page.close()
@@ -250,9 +310,9 @@ async def _refresh_in_shared_browser(
 					accounts_data[idx]['cookies'] = updated_cookies
 					updated_indices.add(idx)
 					refreshed_count += 1
-					print(f'  [SUCCESS] {label}: Cookie 已更新 ✓')
+					print(f'  ✅ {label}: Cookie 已更新')
 				else:
-					print(f'  [FAILED] {label}: Cookie 刷新失败（超时）✗')
+					print(f'  ❌ {label}: Cookie 刷新失败')
 
 		finally:
 			await context.close()
@@ -272,7 +332,8 @@ async def refresh_failed_accounts(
 	核心特性：
 	- 使用持久化浏览器数据目录，LinuxDo 登录态跨次运行保留
 	- 所有失败站点共享同一个浏览器实例，用户只需登录 LinuxDo 一次
-	- 如果 LinuxDo 已登录，OAuth 回调自动完成，无需用户操作
+	- 等待过程中可按 Enter 跳过当前账号
+	- 站点需完成完整 OAuth 流程（认证 + 连接/绑定）后才会生成有效 session
 
 	Args:
 		failed_accounts: 失败账号信息列表
