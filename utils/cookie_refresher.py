@@ -137,7 +137,6 @@ def update_env_accounts(accounts_data: list, env_file: str = '.env') -> bool:
 
 
 async def _poll_login_complete(
-	page,
 	context,
 	domain: str,
 	login_path: str,
@@ -145,22 +144,29 @@ async def _poll_login_complete(
 	timeout: int,
 	skip_event: asyncio.Event | None = None,
 ) -> dict | None:
-	"""轮询等待登录完成：页面离开 login 路径 + session cookie 有效
+	"""轮询等待登录完成：任意选项卡跳转到目标站点非登录页 + session cookie 有效
 
-	OAuth 登录的完整流程：
-	  login 页 → 跳转 LinuxDo → 回调 → 站点显示"连接/绑定" → 用户确认
-	  → 站点后端写入 session cookie → 页面跳转到首页/dashboard
+	实际的 OAuth 流程（LinuxDo 在新选项卡中完成）：
+	  原始 tab: 停留在 login 页，用户点击 "使用 LinuxDo 登录"
+	  → 浏览器自动打开 **新 tab** → linux.do 登录 → connect.linux.do 授权
+	  → 用户点 "连接" / "授权"
+	  → **新 tab** 跳转回目标站点（回调 URL 可能先经过 /login?code=xxx 再 302 到首页）
+	  → 目标站点后端写入 session cookie
+	  → **新 tab** 最终落在目标站点的非 login 页面（如 / 或 /dashboard）
 
-	仅检查 session cookie 不够——OAuth 中间过程也可能有临时 cookie。
-	真正的完成标志是：
-	  1. 页面 URL 不再是 login 路径（已跳转到站点其他页面）
-	  2. 该域名下存在有效的 session cookie
+	所以原始 tab 始终停在 login 页，只有新 tab 才会出现最终跳转。
+	必须遍历 context.pages 中 **所有选项卡** 才能检测到。
+
+	检测策略：
+	  1. 遍历 context 中所有 tab
+	  2. 找到 URL 域名是目标站点、路径不是 login 路径的 tab
+	  3. 检查该域名下是否存在有效的 session cookie（长度 > 20）
+	  4. 全部满足 → 登录完成
 
 	等待过程中可按 Enter 跳过当前账号。
 
 	Args:
-		page: 当前打开的 Playwright Page（用于检测 URL）
-		context: Playwright BrowserContext（用于读 cookie）
+		context: Playwright BrowserContext（遍历所有 tab + 读 cookie）
 		domain: 目标域名 (e.g. "https://anyrouter.top")
 		login_path: 登录路径 (e.g. "/login" 或 "/auth/login")
 		label: 日志标签
@@ -173,15 +179,16 @@ async def _poll_login_complete(
 	import time
 	from urllib.parse import urlparse
 
-	# 预计算所有需要视为"仍在登录中"的路径前缀
-	login_prefixes = set()
-	login_prefixes.add(login_path.rstrip('/'))  # e.g. "/login", "/auth/login"
-	# 也把 linux.do、connect.linux.do 等 OAuth 中间页算在内
-	oauth_domains = {'linux.do', 'connect.linux.do'}
+	# 解析目标域名的 host，用于匹配 tab URL
+	target_host = urlparse(domain).hostname or ''
+	# login 路径前缀（去掉尾部 /），用于判断是否仍在登录页
+	login_prefix = login_path.rstrip('/')
+	# OAuth 中间页域名列表（这些域名上的 tab 不算"已完成"）
+	oauth_hosts = {'linux.do', 'connect.linux.do'}
 
 	start = time.monotonic()
 	last_msg_time = start
-	last_url = ''
+	seen_urls: dict[int, str] = {}  # page_id -> last_url，用于打印 URL 变化
 
 	while time.monotonic() - start < timeout:
 		# 检查是否被用户跳过
@@ -189,36 +196,59 @@ async def _poll_login_complete(
 			print(f'  [SKIP] {label}: 用户按下 Enter，跳过当前账号')
 			return None
 
-		# ---- 检查当前页面 URL ----
+		# ---- 遍历所有选项卡（包括 OAuth 流程中打开的新 tab） ----
+		# 拷贝 pages 列表，避免遍历期间列表变化
 		try:
-			current_url = page.url
+			all_pages = list(context.pages)
 		except Exception:
-			current_url = ''
+			all_pages = []
 
-		# 打印 URL 变化（帮助用户和调试）
-		if current_url != last_url:
-			short_url = current_url[:100] + ('...' if len(current_url) > 100 else '')
-			print(f'  [URL] {short_url}')
-			last_url = current_url
+		found_landing = False
+		for pg in all_pages:
+			try:
+				pg_url = pg.url
+			except Exception:
+				# 页面可能已关闭
+				continue
 
-		parsed = urlparse(current_url)
-		current_path = parsed.path.rstrip('/')
-		current_host = parsed.hostname or ''
+			pg_id = id(pg)
 
-		# 判断是否还在登录/OAuth 流程中
-		still_on_login = False
-		if current_host in oauth_domains:
-			# 还在 LinuxDo OAuth 页面
-			still_on_login = True
-		elif any(current_path == prefix or current_path.startswith(prefix + '/') for prefix in login_prefixes):
-			# 还在站点的 login 路径
-			still_on_login = True
-		elif not current_url or current_url == 'about:blank':
-			still_on_login = True
+			# 打印 URL 变化（帮助用户跟踪 OAuth 多 tab 流程进度）
+			if pg_url != seen_urls.get(pg_id, ''):
+				seen_urls[pg_id] = pg_url
+				short = pg_url[:120] + ('...' if len(pg_url) > 120 else '')
+				print(f'  [TAB] {short}')
 
-		if not still_on_login:
-			# 页面已离开 login，检查 session cookie
-			all_cookies = await context.cookies(domain)
+			if not pg_url or pg_url == 'about:blank':
+				continue
+
+			parsed = urlparse(pg_url)
+			host = parsed.hostname or ''
+			path = parsed.path.rstrip('/') or '/'  # 空路径视为 '/'
+
+			# 跳过 OAuth 中间页（linux.do / connect.linux.do）
+			if host in oauth_hosts:
+				continue
+
+			# 必须在目标站点域名下
+			if host != target_host:
+				continue
+
+			# 还停在 login 路径 → OAuth 回调中间态，没完成
+			if path == login_prefix or path.startswith(login_prefix + '/'):
+				continue
+
+			# ✅ 有一个 tab 已经到达目标站点的非登录页面！
+			found_landing = True
+			break
+
+		if found_landing:
+			# 页面已跳转到首页/dashboard，检查 session cookie 是否有效
+			try:
+				all_cookies = await context.cookies(domain)
+			except Exception:
+				all_cookies = []
+
 			cookies_dict = {}
 			for c in all_cookies:
 				name = c.get('name', '')
@@ -366,9 +396,9 @@ async def _refresh_in_shared_browser(
 				loop = asyncio.get_running_loop()
 				skip_event = _skip_monitor.arm(loop)
 
-				# 等待用户在浏览器中完成完整的登录流程（OAuth + 连接 + 页面跳转）
+				# 等待用户在浏览器中完成完整的登录流程
+				# 注意：OAuth 会在新 tab 中完成，所以必须扫描 context 中所有 tab
 				cookies = await _poll_login_complete(
-					page=page,
 					context=context,
 					domain=acc['domain'],
 					login_path=acc['login_path'],
@@ -380,8 +410,18 @@ async def _refresh_in_shared_browser(
 				# 解除当前 event，防止残留触发影响下一轮
 				_skip_monitor.disarm()
 
-				# 关闭当前站点标签页（不影响 context 中的 cookie）
-				await page.close()
+				# 关闭当前站点相关的所有标签页（OAuth 可能开了新 tab）
+				# 保留一个空白页以免浏览器关闭
+				for pg in list(context.pages):
+					try:
+						if pg != page and pg.url != 'about:blank':
+							await pg.close()
+					except Exception:
+						pass
+				try:
+					await page.close()
+				except Exception:
+					pass
 
 				if cookies:
 					# 更新 accounts_data
