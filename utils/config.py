@@ -187,3 +187,27 @@ def load_accounts_config() -> list[AccountConfig] | None:
 	except Exception as e:
 		print(f'ERROR: Account configuration format is incorrect: {e}')
 		return None
+
+
+def load_raw_accounts_data() -> list[dict] | None:
+	"""从环境变量加载原始账号数据（未解析为 AccountConfig 的原始字典列表）
+
+	用于 Cookie 刷新后直接修改并回写 .env 文件。
+
+	Returns:
+		原始账号字典列表，失败返回 None
+	"""
+	accounts_str = os.getenv('ANYROUTER_ACCOUNTS')
+	if not accounts_str:
+		print('ERROR: ANYROUTER_ACCOUNTS environment variable not found')
+		return None
+
+	try:
+		accounts_data = json.loads(accounts_str)
+		if not isinstance(accounts_data, list):
+			print('ERROR: Account configuration must use array format [{}]')
+			return None
+		return accounts_data
+	except Exception as e:
+		print(f'ERROR: Failed to parse raw accounts data: {e}')
+		return None
