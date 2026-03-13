@@ -3,6 +3,7 @@
 AnyRouter.top 自动签到脚本
 """
 
+import argparse
 import asyncio
 import hashlib
 import json
@@ -14,7 +15,8 @@ import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
-from utils.config import AccountConfig, AppConfig, load_accounts_config
+from utils.config import AccountConfig, AppConfig, load_accounts_config, load_raw_accounts_data
+from utils.cookie_refresher import refresh_failed_accounts
 from utils.notify import notify
 
 load_dotenv()
@@ -143,7 +145,7 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 		with tempfile.TemporaryDirectory() as temp_dir:
 			context = await p.chromium.launch_persistent_context(
 				user_data_dir=temp_dir,
-				headless=False,
+				headless=True,
 				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
 				viewport={'width': 1920, 'height': 1080},
 				args=[
@@ -418,39 +420,61 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None, None
 
 
-async def main():
-	"""主函数"""
-	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
-	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+def parse_args():
+	"""解析命令行参数"""
+	parser = argparse.ArgumentParser(description='AnyRouter.top 多账号自动签到脚本')
+	parser.add_argument(
+		'-y', '--yes',
+		action='store_true',
+		default=False,
+		help='签到失败时自动同意打开浏览器刷新 Cookie（跳过确认提示，仍需手动登录）',
+	)
+	parser.add_argument(
+		'--no-refresh',
+		action='store_true',
+		default=False,
+		help='禁用 Cookie 自动刷新（即使签到失败也不尝试刷新）',
+	)
+	parser.add_argument(
+		'--env-file',
+		type=str,
+		default='.env',
+		help='指定 .env 文件路径（默认: .env）',
+	)
+	return parser.parse_args()
 
-	app_config = AppConfig.load_from_env()
-	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
 
-	accounts = load_accounts_config()
-	if not accounts:
-		print('[FAILED] Unable to load account configuration, program exits')
-		sys.exit(1)
+async def run_check_in_round(
+	accounts: list[AccountConfig],
+	app_config: AppConfig,
+	round_label: str = '',
+) -> tuple[int, list[dict], list[str], dict, dict]:
+	"""执行一轮签到
 
-	print(f'[INFO] Found {len(accounts)} account configurations')
+	Args:
+		accounts: 账号配置列表
+		app_config: 应用配置
+		round_label: 轮次标签（用于日志）
 
-	last_balance_hash = load_balance_hash()
-
+	Returns:
+		(success_count, failed_accounts, notification_content, current_balances, account_check_in_details)
+	"""
+	prefix = f'[{round_label}] ' if round_label else ''
 	success_count = 0
-	total_count = len(accounts)
+	failed_accounts = []  # 签到失败的账号信息
 	notification_content = []
 	current_balances = {}
-	account_check_in_details = {}  # 存储每个账号的签到详情
-	need_notify = False  # 是否需要发送通知
-	balance_changed = False  # 余额是否有变化
+	account_check_in_details = {}
 
-	# 创建客户端管理器
 	client_manager = ClientManager()
 
 	try:
 		for i, account in enumerate(accounts):
 			account_key = f'account_{i + 1}'
 			try:
-				success, user_info_before, user_info_after = await check_in_account(account, i, app_config, client_manager)
+				success, user_info_before, user_info_after = await check_in_account(
+					account, i, app_config, client_manager
+				)
 				if success:
 					success_count += 1
 
@@ -458,9 +482,20 @@ async def main():
 
 				if not success:
 					should_notify_this_account = True
-					need_notify = True
 					account_name = account.get_display_name(i)
-					print(f'[NOTIFY] {account_name} failed, will send notification')
+					print(f'{prefix}[NOTIFY] {account_name} failed, will send notification')
+
+					# 收集失败账号信息，用于后续 Cookie 刷新
+					provider_config = app_config.get_provider(account.provider)
+					if provider_config:
+						failed_accounts.append({
+							'index': i,
+							'provider': account.provider,
+							'api_user': account.api_user,
+							'name': account_name,
+							'domain': provider_config.domain,
+							'login_path': provider_config.login_path,
+						})
 
 				# 存储签到前后的余额信息
 				if user_info_after and user_info_after.get('success'):
@@ -512,14 +547,127 @@ async def main():
 
 			except Exception as e:
 				account_name = account.get_display_name(i)
-				print(f'[FAILED] {account_name} processing exception: {e}')
-				need_notify = True  # 异常也需要通知
+				print(f'{prefix}[FAILED] {account_name} processing exception: {e}')
 				notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+				# 异常也收集为失败账号
+				provider_config = app_config.get_provider(account.provider)
+				if provider_config:
+					failed_accounts.append({
+						'index': i,
+						'provider': account.provider,
+						'api_user': account.api_user,
+						'name': account.get_display_name(i),
+						'domain': provider_config.domain,
+						'login_path': provider_config.login_path,
+					})
 
 	finally:
-		# 确保所有客户端连接都被正确关闭
 		client_manager.close_all()
-		print('[SYSTEM] All client connections closed')
+		print(f'{prefix}[SYSTEM] All client connections closed')
+
+	return success_count, failed_accounts, notification_content, current_balances, account_check_in_details
+
+
+async def main():
+	"""主函数"""
+	args = parse_args()
+
+	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
+	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+	if args.yes:
+		print('[INFO] Auto-yes mode enabled (-y): will open browser for cookie refresh on failure')
+
+	app_config = AppConfig.load_from_env()
+	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
+
+	accounts = load_accounts_config()
+	if not accounts:
+		print('[FAILED] Unable to load account configuration, program exits')
+		sys.exit(1)
+
+	print(f'[INFO] Found {len(accounts)} account configurations')
+
+	last_balance_hash = load_balance_hash()
+	total_count = len(accounts)
+	need_notify = False
+	balance_changed = False
+
+	# ====== 第一轮签到 ======
+	success_count, failed_accounts, notification_content, current_balances, account_check_in_details = (
+		await run_check_in_round(accounts, app_config, round_label='Round 1')
+	)
+
+	if failed_accounts:
+		need_notify = True
+
+	# ====== Cookie 刷新逻辑 ======
+	if failed_accounts and not args.no_refresh:
+		print(f'\n[INFO] {len(failed_accounts)} account(s) failed, attempting cookie refresh...')
+
+		# 加载原始账号数据用于更新
+		raw_accounts_data = load_raw_accounts_data()
+		if raw_accounts_data:
+			refreshed = await refresh_failed_accounts(
+				failed_accounts=failed_accounts,
+				accounts_data=raw_accounts_data,
+				providers_config=app_config.providers,
+				auto_yes=args.yes,
+				env_file=args.env_file,
+			)
+
+			# 如果有刷新成功的，重新加载配置并对这些账号重试签到
+			if refreshed > 0:
+				print(f'\n[INFO] {refreshed} cookie(s) refreshed, re-running check-in for refreshed accounts...')
+
+				# 重新加载 .env 以获取更新后的 cookies
+				load_dotenv(override=True)
+				refreshed_accounts = load_accounts_config()
+
+				if refreshed_accounts:
+					# 只重试之前失败的账号
+					failed_indices = {acc['index'] for acc in failed_accounts}
+					retry_accounts = [
+						acc for i, acc in enumerate(refreshed_accounts) if i in failed_indices
+					]
+
+					# 构建一个只包含重试账号的列表（保持原始索引映射）
+					retry_index_map = {}  # retry列表索引 -> 原始索引
+					for retry_i, orig_i in enumerate(sorted(failed_indices)):
+						if orig_i < len(refreshed_accounts):
+							retry_index_map[retry_i] = orig_i
+
+					retry_success, _, retry_notifications, retry_balances, retry_details = (
+						await run_check_in_round(retry_accounts, app_config, round_label='Retry')
+					)
+
+					# 合并重试结果
+					success_count += retry_success
+
+					# 更新余额信息（用重试后的覆盖）
+					for retry_key, orig_i in retry_index_map.items():
+						orig_key = f'account_{orig_i + 1}'
+						retry_key_str = f'account_{retry_key + 1}'
+						if retry_key_str in retry_balances:
+							current_balances[orig_key] = retry_balances[retry_key_str]
+						if retry_key_str in retry_details:
+							account_check_in_details[orig_key] = retry_details[retry_key_str]
+
+					# 更新通知内容：移除已重试成功的失败通知
+					if retry_success > 0:
+						# 从 notification_content 中移除重试成功的账号
+						retried_names = {acc.get_display_name(retry_index_map.get(ri, ri))
+							for ri, acc in enumerate(retry_accounts)}
+						notification_content = [
+							n for n in notification_content
+							if not any(name in n for name in retried_names)
+						]
+						# 添加重试的通知
+						for n in retry_notifications:
+							notification_content.append(f'[RETRY] {n}')
+
+					print(f'[INFO] Retry complete: {retry_success}/{len(retry_accounts)} succeeded')
+		else:
+			print('[WARNING] Could not load raw accounts data for cookie refresh')
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
