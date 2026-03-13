@@ -2,20 +2,28 @@
 """
 Cookie 刷新模块
 
-通过 Playwright 打开有头浏览器，让用户手动完成登录（OAuth / LinuxDo 等第三方认证），
-自动检测登录完成后抓取新的 session cookie，更新 .env 配置。
-
-每个失败账号独立开启/销毁一个浏览器实例，避免 cookie 互相污染。
+核心设计：
+1. 使用 Playwright 持久化用户数据目录（~/.anyrouter-browser-data），
+   LinuxDo 的登录态跨次运行保留，用户只需首次登录一次。
+2. 所有失败站点共享同一个浏览器实例（同一个 BrowserContext），
+   浏览器按域名天然隔离 cookie，LinuxDo OAuth 登录态自动复用。
+3. 导航到站点登录页 → 点击 LinuxDo OAuth → 自动回调 → 轮询目标站 session cookie。
 """
 
 import json
+import os
 
 from playwright.async_api import async_playwright
 
-# 用户手动登录的最大等待时间（秒）
-LOGIN_TIMEOUT = 300
+# 持久化浏览器用户数据目录（保存 LinuxDo 登录态等）
+BROWSER_DATA_DIR = os.path.join(os.path.expanduser('~'), '.anyrouter-browser-data')
+
+# 单个站点 OAuth 回调等待时间（秒）—— 如果 LinuxDo 已登录，回调通常 5~15s 内完成
+OAUTH_AUTO_TIMEOUT = 30
+# 需要用户手动登录 LinuxDo 时的最大等待时间（秒）
+MANUAL_LOGIN_TIMEOUT = 300
 # 轮询 cookie 的间隔（秒）
-POLL_INTERVAL = 2
+POLL_INTERVAL = 1.5
 
 
 def update_env_accounts(accounts_data: list, env_file: str = '.env') -> bool:
@@ -57,19 +65,17 @@ def update_env_accounts(accounts_data: list, env_file: str = '.env') -> bool:
 		return False
 
 
-async def _wait_for_session_cookie(context, domain: str, label: str, timeout: int = LOGIN_TIMEOUT) -> dict | None:
-	"""轮询等待 session cookie 出现
-
-	登录完成的判断标准：该域名下出现名为 "session" 的 cookie。
+async def _poll_session_cookie(context, domain: str, label: str, timeout: int) -> dict | None:
+	"""轮询等待目标域名出现 session cookie
 
 	Args:
 		context: Playwright BrowserContext
-		domain: 目标域名
+		domain: 目标域名 (e.g. "https://anyrouter.top")
 		label: 日志标签
 		timeout: 最大等待秒数
 
 	Returns:
-		包含该域名所有 cookie 的字典，超时返回 None
+		该域名下所有 cookie 的 {name: value} 字典，超时返回 None
 	"""
 	import asyncio
 	import time
@@ -88,98 +94,170 @@ async def _wait_for_session_cookie(context, domain: str, label: str, timeout: in
 
 		if 'session' in cookies_dict and len(cookies_dict['session']) > 20:
 			elapsed = int(time.monotonic() - start)
-			print(f'\n[SUCCESS] {label}: Login detected! (session cookie captured in {elapsed}s)')
+			print(f'  [SUCCESS] {label}: session cookie captured ({elapsed}s)')
 			return cookies_dict
 
 		# 每 30 秒打印一次等待提示
 		now = time.monotonic()
 		if now - last_msg_time >= 30:
 			remaining = int(timeout - (now - start))
-			print(f'[WAITING] {label}: Still waiting for login... ({remaining}s remaining)')
+			print(f'  [WAITING] {label}: Still waiting for login... ({remaining}s remaining)')
 			last_msg_time = now
 
 		await asyncio.sleep(POLL_INTERVAL)
 
-	print(f'\n[TIMEOUT] {label}: Login timeout after {timeout}s')
 	return None
 
 
-async def refresh_single_account(
-	domain: str,
-	login_path: str,
-	account_label: str,
-	timeout: int = LOGIN_TIMEOUT,
-) -> dict | None:
-	"""为单个账号打开浏览器，等待用户手动登录，抓取 cookie 后关闭
+async def _check_linuxdo_logged_in(context) -> bool:
+	"""检查持久化 context 中是否已有 LinuxDo 登录态
+
+	通过检查 linux.do 域名下是否存在 _t cookie（Discourse 登录标志）来判断。
+	"""
+	try:
+		cookies = await context.cookies('https://linux.do')
+		cookie_names = {c.get('name', '') for c in cookies}
+		# Discourse 登录后会有 _t cookie
+		return '_t' in cookie_names
+	except Exception:
+		return False
+
+
+async def _refresh_in_shared_browser(
+	failed_accounts: list[dict],
+	accounts_data: list[dict],
+) -> tuple[int, set]:
+	"""在共享的持久化浏览器中，依次为所有失败账号刷新 cookie
 
 	流程：
-	1. 启动有头浏览器（用户可见）
-	2. 导航到登录页
-	3. 终端提示用户在浏览器中完成登录
-	4. 后台轮询检测 session cookie
-	5. 检测到 → 抓取所有 cookie → 关闭浏览器
-	6. 超时 → 关闭浏览器 → 返回 None
-
-	Args:
-		domain: 网站域名
-		login_path: 登录页面路径
-		account_label: 显示标签
-		timeout: 最大等待秒数
+	1. 启动持久化 context（保留 LinuxDo 登录态）
+	2. 检测 LinuxDo 是否已登录
+	   - 已登录：直接开始，每个站点自动 OAuth 回调
+	   - 未登录：先导航到 linux.do 让用户登录一次
+	3. 逐个站点：打开标签页 → 导航到登录页 → 等待 session cookie → 关闭标签页
+	4. 所有站点完成后关闭浏览器
 
 	Returns:
-		新的 cookies 字典，失败返回 None
+		(refreshed_count, updated_indices)
 	"""
-	login_url = f'{domain}{login_path}'
-	print(f'\n[BROWSER] {account_label}: Opening browser → {login_url}')
-	print(f'[BROWSER] {account_label}: Please complete login in the browser window.')
-	print(f'[BROWSER] {account_label}: Waiting up to {timeout}s for login...')
+	import asyncio
 
-	browser = None
-	context = None
+	total = len(failed_accounts)
+	refreshed_count = 0
+	updated_indices = set()
 
-	try:
-		async with async_playwright() as p:
-			# 有头模式启动，用户可以看到并操作
-			browser = await p.chromium.launch(
-				headless=False,
-				args=[
-					'--disable-blink-features=AutomationControlled',
-					'--disable-dev-shm-usage',
-					'--no-sandbox',
-				],
-			)
+	async with async_playwright() as p:
+		# 使用持久化用户数据目录，LinuxDo 登录态跨次运行保留
+		context = await p.chromium.launch_persistent_context(
+			user_data_dir=BROWSER_DATA_DIR,
+			headless=False,
+			user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+			viewport={'width': 1280, 'height': 900},
+			args=[
+				'--disable-blink-features=AutomationControlled',
+				'--disable-dev-shm-usage',
+				'--no-sandbox',
+			],
+		)
 
-			context = await browser.new_context(
-				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				viewport={'width': 1280, 'height': 900},
-			)
-
-			page = await context.new_page()
-
-			try:
-				await page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
-			except Exception as e:
-				print(f'[WARNING] {account_label}: Page load issue (may still work): {str(e)[:80]}')
-
-			# 轮询等待 session cookie
-			cookies = await _wait_for_session_cookie(context, domain, account_label, timeout)
-
-			# 不管成功失败都关闭
-			await context.close()
-			await browser.close()
-			return cookies
-
-	except Exception as e:
-		print(f'[FAILED] {account_label}: Browser error - {e}')
-		# 确保清理
 		try:
-			if context:
-				await context.close()
-			if browser:
-				await browser.close()
-		except Exception:
-			pass
-		return None
+			# ====== 检查 LinuxDo 登录态 ======
+			linuxdo_logged_in = await _check_linuxdo_logged_in(context)
+
+			if linuxdo_logged_in:
+				print('[INFO] LinuxDo 已登录（持久化 session 有效），将自动完成 OAuth 回调')
+			else:
+				print('\n[BROWSER] LinuxDo 未登录，请在浏览器中登录 LinuxDo（仅需一次）')
+				print('[BROWSER] 登录完成后，后续所有站点将自动完成 OAuth 认证')
+
+				page = await context.new_page()
+				try:
+					await page.goto('https://linux.do', wait_until='domcontentloaded', timeout=30000)
+				except Exception as e:
+					print(f'[WARNING] LinuxDo page load issue: {str(e)[:80]}')
+
+				# 等待用户登录 LinuxDo
+				print(f'[BROWSER] 等待 LinuxDo 登录... (最长 {MANUAL_LOGIN_TIMEOUT}s)')
+				import time
+				start = time.monotonic()
+				while time.monotonic() - start < MANUAL_LOGIN_TIMEOUT:
+					if await _check_linuxdo_logged_in(context):
+						print('[SUCCESS] LinuxDo 登录成功！')
+						linuxdo_logged_in = True
+						break
+					await asyncio.sleep(POLL_INTERVAL)
+
+				if not linuxdo_logged_in:
+					print('[TIMEOUT] LinuxDo 登录超时，跳过 Cookie 刷新')
+					await page.close()
+					await context.close()
+					return 0, set()
+
+				# 登录成功后等一下让 cookie 稳定
+				await asyncio.sleep(1)
+				await page.close()
+
+			# ====== 逐个刷新失败站点 ======
+			for seq, acc in enumerate(failed_accounts, 1):
+				label = f'[{acc["provider"]}] {acc["name"]}'
+				login_url = f'{acc["domain"]}{acc["login_path"]}'
+
+				print(f'\n{"─" * 60}')
+				print(f'🔄 [{seq}/{total}] {label}')
+				print(f'   {login_url}')
+				print(f'{"─" * 60}')
+
+				page = await context.new_page()
+
+				try:
+					await page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
+				except Exception as e:
+					print(f'  [WARNING] Page load issue (may still work): {str(e)[:80]}')
+
+				# 第一阶段：快速等待（OAuth 自动回调，通常 5~15s）
+				cookies = await _poll_session_cookie(
+					context, acc['domain'], label, timeout=OAUTH_AUTO_TIMEOUT,
+				)
+
+				if not cookies:
+					# 第二阶段：自动回调未成功，可能需要用户手动操作
+					print(f'  [INFO] {label}: 自动 OAuth 未完成，请在浏览器中手动完成登录')
+					print(f'  [INFO] 等待手动登录... (最长 {MANUAL_LOGIN_TIMEOUT}s)')
+					cookies = await _poll_session_cookie(
+						context, acc['domain'], label, timeout=MANUAL_LOGIN_TIMEOUT,
+					)
+
+				# 关闭当前站点标签页（不影响 context 中的 cookie）
+				await page.close()
+
+				if cookies:
+					# 更新 accounts_data
+					idx = acc['index']
+					old_cookies = accounts_data[idx].get('cookies', {})
+
+					if isinstance(old_cookies, dict):
+						updated_cookies = {}
+						for key in old_cookies:
+							if key in cookies:
+								updated_cookies[key] = cookies[key]
+							else:
+								updated_cookies[key] = old_cookies[key]
+						if 'session' in cookies and 'session' not in updated_cookies:
+							updated_cookies['session'] = cookies['session']
+					else:
+						updated_cookies = {'session': cookies.get('session', '')}
+
+					accounts_data[idx]['cookies'] = updated_cookies
+					updated_indices.add(idx)
+					refreshed_count += 1
+					print(f'  [SUCCESS] {label}: Cookie 已更新 ✓')
+				else:
+					print(f'  [FAILED] {label}: Cookie 刷新失败（超时）✗')
+
+		finally:
+			await context.close()
+
+	return refreshed_count, updated_indices
 
 
 async def refresh_failed_accounts(
@@ -189,16 +267,15 @@ async def refresh_failed_accounts(
 	auto_yes: bool = False,
 	env_file: str = '.env',
 ) -> int:
-	"""为签到失败的账号逐一打开浏览器，让用户手动登录并抓取新 cookie
+	"""为签到失败的账号刷新 Cookie
+
+	核心特性：
+	- 使用持久化浏览器数据目录，LinuxDo 登录态跨次运行保留
+	- 所有失败站点共享同一个浏览器实例，用户只需登录 LinuxDo 一次
+	- 如果 LinuxDo 已登录，OAuth 回调自动完成，无需用户操作
 
 	Args:
-		failed_accounts: 失败账号信息列表，每项包含:
-			- index: 账号在 accounts_data 中的索引
-			- provider: 提供商名称
-			- api_user: API 用户 ID
-			- name: 显示名称
-			- domain: 域名
-			- login_path: 登录路径
+		failed_accounts: 失败账号信息列表
 		accounts_data: 完整的账号数据列表（会被就地修改）
 		providers_config: 提供商配置字典
 		auto_yes: 是否跳过确认直接开始（-y 参数）
@@ -223,8 +300,9 @@ async def refresh_failed_accounts(
 	if not auto_yes:
 		try:
 			answer = input(
-				'\n🔄 是否打开浏览器手动登录刷新 Cookie？\n'
-				'   (将逐一为每个失败账号打开浏览器，您需要在浏览器中完成登录)\n'
+				'\n🔄 是否打开浏览器刷新 Cookie？\n'
+				'   所有站点共享同一个浏览器，LinuxDo 只需登录一次\n'
+				f'   (浏览器数据保存在 {BROWSER_DATA_DIR})\n'
 				'   [y/N]: '
 			).strip().lower()
 			if answer not in ('y', 'yes'):
@@ -234,67 +312,20 @@ async def refresh_failed_accounts(
 			print('\n[INFO] Cookie refresh cancelled')
 			return 0
 
-	# ====== 逐一刷新 ======
-	refreshed_count = 0
-	updated_indices = set()
-	total = len(failed_accounts)
-
-	for seq, acc in enumerate(failed_accounts, 1):
-		label = f'[{acc["provider"]}] {acc["name"]}'
-
-		print(f'\n{"─" * 60}')
-		print(f'🔄 [{seq}/{total}] Refreshing: {label}')
-		print(f'   Domain: {acc["domain"]}')
-		print(f'   Login:  {acc["domain"]}{acc["login_path"]}')
-		print(f'{"─" * 60}')
-
-		# 每个账号独立开启/销毁浏览器
-		new_cookies = await refresh_single_account(
-			domain=acc['domain'],
-			login_path=acc['login_path'],
-			account_label=label,
-		)
-
-		if new_cookies:
-			# 更新 accounts_data 中对应账号的 cookies
-			idx = acc['index']
-			old_cookies = accounts_data[idx].get('cookies', {})
-
-			if isinstance(old_cookies, dict):
-				# 保留原有 cookie 键名结构，用新值覆盖
-				updated_cookies = {}
-				for key in old_cookies:
-					if key in new_cookies:
-						updated_cookies[key] = new_cookies[key]
-					else:
-						updated_cookies[key] = old_cookies[key]
-				# 确保 session 在里面
-				if 'session' in new_cookies and 'session' not in updated_cookies:
-					updated_cookies['session'] = new_cookies['session']
-			else:
-				updated_cookies = {'session': new_cookies.get('session', '')}
-
-			accounts_data[idx]['cookies'] = updated_cookies
-			updated_indices.add(idx)
-			refreshed_count += 1
-			print(f'[SUCCESS] {label}: Cookie updated ✓')
-		else:
-			print(f'[FAILED] {label}: Cookie refresh failed ✗')
-
-		# 如果还有下一个，给用户一点缓冲时间
-		if seq < total:
-			try:
-				input(f'\n  ⏎ Press Enter to continue to next account ({seq}/{total} done)...')
-			except (KeyboardInterrupt, EOFError):
-				print(f'\n[INFO] Remaining {total - seq} account(s) skipped by user')
-				break
+	# ====== 在共享浏览器中刷新所有账号 ======
+	refreshed_count, updated_indices = await _refresh_in_shared_browser(
+		failed_accounts, accounts_data,
+	)
 
 	# ====== 写入 .env ======
+	total = len(failed_accounts)
 	if updated_indices:
 		if update_env_accounts(accounts_data, env_file):
-			print(f'\n✅ Successfully refreshed {refreshed_count}/{total} account(s)')
-			print(f'📁 Updated {env_file} with new cookies')
+			print(f'\n✅ 成功刷新 {refreshed_count}/{total} 个账号')
+			print(f'📁 已更新 {env_file}')
 		else:
-			print(f'\n⚠️  Refreshed {refreshed_count} cookie(s) but failed to save to {env_file}')
+			print(f'\n⚠️  刷新了 {refreshed_count} 个 Cookie 但写入 {env_file} 失败')
+	else:
+		print(f'\n❌ {total} 个账号全部刷新失败')
 
 	return refreshed_count
