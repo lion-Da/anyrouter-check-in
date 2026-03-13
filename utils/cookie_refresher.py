@@ -32,31 +32,69 @@ POLL_INTERVAL = 1.5
 
 
 # ────────────────────────────────────────────────────────────
-# 非阻塞 stdin 监听（用于 "按 Enter 跳过"）
+# 全局唯一 stdin 监听线程（解决多线程竞争 stdin 的问题）
 # ────────────────────────────────────────────────────────────
 
-def _start_skip_listener(loop: asyncio.AbstractEventLoop) -> asyncio.Event:
-	"""启动一个后台线程监听 stdin，按 Enter 时设置 asyncio.Event
+class _StdinSkipMonitor:
+	"""全局唯一的 stdin Enter 监听器
 
-	Args:
-		loop: 当前运行的事件循环
-
-	Returns:
-		skip_event: 外部通过 skip_event.is_set() 检查是否按下了 Enter
+	只有一个后台线程持续读取 stdin，每次按 Enter 都设置当前活跃的 event。
+	外部通过 arm() 注册新的 asyncio.Event，通过 disarm() 解除。
 	"""
-	skip_event = asyncio.Event()
 
-	def _listen():
-		try:
-			sys.stdin.readline()
-		except (EOFError, OSError):
-			pass
-		# 线程安全地在事件循环中设置 event
-		loop.call_soon_threadsafe(skip_event.set)
+	def __init__(self):
+		self._lock = threading.Lock()
+		self._loop: asyncio.AbstractEventLoop | None = None
+		self._event: asyncio.Event | None = None
+		self._thread: threading.Thread | None = None
+		self._started = False
 
-	t = threading.Thread(target=_listen, daemon=True)
-	t.start()
-	return skip_event
+	def _reader_loop(self):
+		"""后台线程：持续读 stdin，每收到一行就 set 当前 event"""
+		while True:
+			try:
+				sys.stdin.readline()
+			except (EOFError, OSError):
+				# stdin 被关闭（如 pipe 模式），停止监听
+				return
+			with self._lock:
+				if self._event is not None and self._loop is not None:
+					ev = self._event
+					lp = self._loop
+					lp.call_soon_threadsafe(ev.set)
+
+	def _ensure_started(self):
+		"""确保后台线程只启动一次"""
+		if self._started:
+			return
+		self._started = True
+		self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+		self._thread.start()
+
+	def arm(self, loop: asyncio.AbstractEventLoop) -> asyncio.Event:
+		"""注册一个新的 skip event，返回供 poll 循环检查
+
+		Args:
+			loop: 当前事件循环
+
+		Returns:
+			asyncio.Event，被 Enter 触发后 is_set() 为 True
+		"""
+		self._ensure_started()
+		event = asyncio.Event()
+		with self._lock:
+			self._loop = loop
+			self._event = event
+		return event
+
+	def disarm(self):
+		"""解除当前 event，避免残留触发下一轮"""
+		with self._lock:
+			self._event = None
+
+
+# 模块级单例
+_skip_monitor = _StdinSkipMonitor()
 
 
 def update_env_accounts(accounts_data: list, env_file: str = '.env') -> bool:
@@ -98,24 +136,33 @@ def update_env_accounts(accounts_data: list, env_file: str = '.env') -> bool:
 		return False
 
 
-async def _poll_session_cookie(
+async def _poll_login_complete(
+	page,
 	context,
 	domain: str,
+	login_path: str,
 	label: str,
 	timeout: int,
 	skip_event: asyncio.Event | None = None,
 ) -> dict | None:
-	"""轮询等待目标域名出现 session cookie，支持 Enter 跳过
+	"""轮询等待登录完成：页面离开 login 路径 + session cookie 有效
 
-	站点在完成 OAuth 认证 + 连接/绑定 后才会写入 session cookie，
-	因此本函数会一直等到：
-	- session cookie 出现（成功）
-	- 达到超时时间（失败）
-	- 用户按下 Enter（跳过）
+	OAuth 登录的完整流程：
+	  login 页 → 跳转 LinuxDo → 回调 → 站点显示"连接/绑定" → 用户确认
+	  → 站点后端写入 session cookie → 页面跳转到首页/dashboard
+
+	仅检查 session cookie 不够——OAuth 中间过程也可能有临时 cookie。
+	真正的完成标志是：
+	  1. 页面 URL 不再是 login 路径（已跳转到站点其他页面）
+	  2. 该域名下存在有效的 session cookie
+
+	等待过程中可按 Enter 跳过当前账号。
 
 	Args:
-		context: Playwright BrowserContext
+		page: 当前打开的 Playwright Page（用于检测 URL）
+		context: Playwright BrowserContext（用于读 cookie）
 		domain: 目标域名 (e.g. "https://anyrouter.top")
+		login_path: 登录路径 (e.g. "/login" 或 "/auth/login")
 		label: 日志标签
 		timeout: 最大等待秒数
 		skip_event: 按 Enter 时会被 set 的事件，为 None 则不支持跳过
@@ -124,9 +171,17 @@ async def _poll_session_cookie(
 		该域名下所有 cookie 的 {name: value} 字典，超时/跳过返回 None
 	"""
 	import time
+	from urllib.parse import urlparse
+
+	# 预计算所有需要视为"仍在登录中"的路径前缀
+	login_prefixes = set()
+	login_prefixes.add(login_path.rstrip('/'))  # e.g. "/login", "/auth/login"
+	# 也把 linux.do、connect.linux.do 等 OAuth 中间页算在内
+	oauth_domains = {'linux.do', 'connect.linux.do'}
 
 	start = time.monotonic()
 	last_msg_time = start
+	last_url = ''
 
 	while time.monotonic() - start < timeout:
 		# 检查是否被用户跳过
@@ -134,18 +189,47 @@ async def _poll_session_cookie(
 			print(f'  [SKIP] {label}: 用户按下 Enter，跳过当前账号')
 			return None
 
-		all_cookies = await context.cookies(domain)
-		cookies_dict = {}
-		for c in all_cookies:
-			name = c.get('name', '')
-			value = c.get('value', '')
-			if name and value:
-				cookies_dict[name] = value
+		# ---- 检查当前页面 URL ----
+		try:
+			current_url = page.url
+		except Exception:
+			current_url = ''
 
-		if 'session' in cookies_dict and len(cookies_dict['session']) > 20:
-			elapsed = int(time.monotonic() - start)
-			print(f'  [SUCCESS] {label}: session cookie 已捕获 ({elapsed}s)')
-			return cookies_dict
+		# 打印 URL 变化（帮助用户和调试）
+		if current_url != last_url:
+			short_url = current_url[:100] + ('...' if len(current_url) > 100 else '')
+			print(f'  [URL] {short_url}')
+			last_url = current_url
+
+		parsed = urlparse(current_url)
+		current_path = parsed.path.rstrip('/')
+		current_host = parsed.hostname or ''
+
+		# 判断是否还在登录/OAuth 流程中
+		still_on_login = False
+		if current_host in oauth_domains:
+			# 还在 LinuxDo OAuth 页面
+			still_on_login = True
+		elif any(current_path == prefix or current_path.startswith(prefix + '/') for prefix in login_prefixes):
+			# 还在站点的 login 路径
+			still_on_login = True
+		elif not current_url or current_url == 'about:blank':
+			still_on_login = True
+
+		if not still_on_login:
+			# 页面已离开 login，检查 session cookie
+			all_cookies = await context.cookies(domain)
+			cookies_dict = {}
+			for c in all_cookies:
+				name = c.get('name', '')
+				value = c.get('value', '')
+				if name and value:
+					cookies_dict[name] = value
+
+			if 'session' in cookies_dict and len(cookies_dict['session']) > 20:
+				elapsed = int(time.monotonic() - start)
+				print(f'  [SUCCESS] {label}: 登录完成，session cookie 已捕获 ({elapsed}s)')
+				return cookies_dict
 
 		# 每 30 秒打印一次等待提示
 		now = time.monotonic()
@@ -236,7 +320,7 @@ async def _refresh_in_shared_browser(
 				# 等待用户登录 LinuxDo（支持 Enter 跳过）
 				print(f'[BROWSER] 等待 LinuxDo 登录... (最长 {LOGIN_TIMEOUT}s，按 Enter 跳过)')
 				loop = asyncio.get_running_loop()
-				skip_event = _start_skip_listener(loop)
+				skip_event = _skip_monitor.arm(loop)
 
 				start = time.monotonic()
 				while time.monotonic() - start < LOGIN_TIMEOUT:
@@ -248,6 +332,8 @@ async def _refresh_in_shared_browser(
 						linuxdo_logged_in = True
 						break
 					await asyncio.sleep(POLL_INTERVAL)
+
+				_skip_monitor.disarm()
 
 				if not linuxdo_logged_in and not skip_event.is_set():
 					print('[TIMEOUT] LinuxDo 登录超时')
@@ -276,16 +362,23 @@ async def _refresh_in_shared_browser(
 				except Exception as e:
 					print(f'  [WARNING] 页面加载异常 (可能仍可操作): {str(e)[:80]}')
 
-				# 启动 Enter 跳过监听
+				# 注册 Enter 跳过监听（复用全局唯一线程，替换 event）
 				loop = asyncio.get_running_loop()
-				skip_event = _start_skip_listener(loop)
+				skip_event = _skip_monitor.arm(loop)
 
-				# 等待用户在浏览器中完成完整的登录流程（OAuth + 连接）
-				cookies = await _poll_session_cookie(
-					context, acc['domain'], label,
+				# 等待用户在浏览器中完成完整的登录流程（OAuth + 连接 + 页面跳转）
+				cookies = await _poll_login_complete(
+					page=page,
+					context=context,
+					domain=acc['domain'],
+					login_path=acc['login_path'],
+					label=label,
 					timeout=LOGIN_TIMEOUT,
 					skip_event=skip_event,
 				)
+
+				# 解除当前 event，防止残留触发影响下一轮
+				_skip_monitor.disarm()
 
 				# 关闭当前站点标签页（不影响 context 中的 cookie）
 				await page.close()
