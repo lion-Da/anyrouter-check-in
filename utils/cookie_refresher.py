@@ -231,14 +231,17 @@ async def _check_linuxdo_logged_in(context) -> bool:
 		return False
 
 
-async def _close_extra_pages(context, keep_page=None):
-	"""关闭多余的标签页，只保留 keep_page（或一个空白页）
+async def _close_extra_pages(context):
+	"""关闭所有标签页，只保留一个空白页
 
-	OAuth 流程会打开新 tab，处理完一个站点后需要清理，
-	避免残留 tab 影响下一个站点。
+	Chromium persistent context 在所有 page 关闭后会自动销毁，
+	所以必须先创建一个空白页再关闭其他页面，确保 context 始终存活。
 	"""
+	# 先开一个空白页保底，防止 context 因 0 page 而自毁
+	blank = await context.new_page()
+
 	for pg in list(context.pages):
-		if pg == keep_page:
+		if pg == blank:
 			continue
 		try:
 			await pg.close()
